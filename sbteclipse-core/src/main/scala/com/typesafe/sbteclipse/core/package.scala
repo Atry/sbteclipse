@@ -68,7 +68,7 @@ package object core {
     }
 
   def evaluateTask[A](key: TaskKey[A], ref: ProjectRef)(implicit state: State): ValidationNELS[A] =
-    EvaluateTask(structure, key, state, ref, EvaluateConfig(false)) match {
+    EvaluateTask(structure, key, state, ref, EvaluateConfig(false, Nil)) match { // TODO Is Nil the correct value (0.11->0.12)?
       case Some((_, Value(a))) => a.success
       case Some((_, Inc(inc))) => "Error evaluating task '%s': %s".format(key.key, Incomplete.show(inc.tpe)).failNel
       case None => "Undefined task '%s' for '%s'!".format(key.key, ref.project).failNel
