@@ -61,24 +61,22 @@ package object core {
   //    (Space ~> key ~ ("=" ~> charClass(_ => true).+)) map { case (k, v) => k -> v.mkString }
   //  }
 
-  def setting[A](key: SettingKey[A])(implicit state: State): ValidationNELS[A] =
-    key get structure.data match {
+  def setting[A](key: SettingKey[A], state: State): ValidationNELS[A] =
+    key get structure(state).data match {
       case Some(a) => a.success
       case None => "Undefined setting '%s'!".format(key.key).failNel
     }
 
-  def evaluateTask[A](key: TaskKey[A], ref: ProjectRef)(implicit state: State): ValidationNELS[A] =
-    EvaluateTask(structure, key, state, ref, EvaluateConfig(false)) match {
+  def evaluateTask[A](key: TaskKey[A], ref: ProjectRef, state: State): ValidationNELS[A] =
+    EvaluateTask(structure(state), key, state, ref, EvaluateConfig(false)) match {
       case Some((_, Value(a))) => a.success
       case Some((_, Inc(inc))) => "Error evaluating task '%s': %s".format(key.key, Incomplete.show(inc.tpe)).failNel
       case None => "Undefined task '%s' for '%s'!".format(key.key, ref.project).failNel
     }
 
-  def extracted(implicit state: State): Extracted =
-    Project.extract(state)
+  def extracted(state: State): Extracted = Project.extract(state)
 
-  def structure(implicit state: State): BuildStructure =
-    extracted.structure
+  def structure(state: State): BuildStructure = extracted(state).structure
 
   type NELS = NonEmptyList[String]
 

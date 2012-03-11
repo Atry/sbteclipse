@@ -70,7 +70,7 @@ private object Eclipse {
   val StandardVmType = "org.eclipse.jdt.internal.debug.ui.launcher.StandardVMType"
 
   def eclipseCommand(commandName: String) =
-    Command(commandName)(_ => parser)((state, args) => action(args.toMap)(state))
+    Command(commandName)(_ => parser)((state, args) => action(args.toMap, state))
 
   def parser = {
     import EclipseOpts._
@@ -86,51 +86,53 @@ private object Eclipse {
     (Space ~> ExecutionEnvironment ~ ("=" ~> executionEnvironments)) map { case (k, v) => k -> withName(v) }
   }
 
-  def action(args: Map[String, Any])(implicit state: State) = {
+  def action(args: Map[String, Any], state: State) = {
     state.log.info("About to create Eclipse project files for your project(s).")
     import EclipseOpts._
     effects(
       (args get ExecutionEnvironment).asInstanceOf[Option[EclipseExecutionEnvironment.Value]],
-      (args get SkipParents).asInstanceOf[Option[Boolean]] getOrElse skipParents(ThisBuild),
-      (args get WithSource).asInstanceOf[Option[Boolean]] // TODO Move to project level!
-    ).fold(onFailure, onSuccess)
+      (args get SkipParents).asInstanceOf[Option[Boolean]] getOrElse skipParents(ThisBuild, state),
+      (args get WithSource).asInstanceOf[Option[Boolean]],
+      state
+    ).fold(onFailure(state), onSuccess(state))
   }
 
   def effects(
     executionEnvironmentArg: Option[EclipseExecutionEnvironment.Value],
     skipParents: Boolean,
-    withSourceArg: Option[Boolean])(
-      implicit state: State) = {
+    withSourceArg: Option[Boolean],
+    state: State) = {
     val effects = for {
-      ref <- structure.allProjectRefs
-      project <- Project.getProject(ref, structure) if project.aggregate.isEmpty || !skipParents
+      ref <- structure(state).allProjectRefs
+      project <- Project.getProject(ref, structure(state)) if project.aggregate.isEmpty || !skipParents
     } yield {
-      val configs = configurations(ref)
-      val applic = classpathEntryTransformerFactory(ref).createTransformer(ref, state) |@|
-        name(ref) |@|
-        buildDirectory |@|
-        baseDirectory(ref) |@|
-        mapConfigs(configs, srcDirectories(ref, createSrc(ref), eclipseOutput(ref))) |@|
-        scalacOptions(ref) |@|
-        mapConfigs(configs, externalDependencies(ref, withSourceArg getOrElse withSource(ref))) |@|
-        mapConfigs(configs, projectDependencies(ref, project))
+      val configs = configurations(ref, state)
+      val applic = classpathEntryTransformerFactory(ref, state).createTransformer(ref, state) |@|
+        name(ref, state) |@|
+        buildDirectory(state) |@|
+        baseDirectory(ref, state) |@|
+        mapConfigs(configs, srcDirectories(ref, createSrc(ref, state), eclipseOutput(ref, state), state)) |@|
+        scalacOptions(ref, state) |@|
+        mapConfigs(configs, externalDependencies(ref, withSourceArg getOrElse withSource(ref, state), state)) |@|
+        mapConfigs(configs, projectDependencies(ref, project, state))
       applic(
         effect(
-          jreContainer(executionEnvironmentArg orElse executionEnvironment(ref)),
-          preTasks(ref),
-          relativizeLibs(ref)
+          jreContainer(executionEnvironmentArg orElse executionEnvironment(ref, state)),
+          preTasks(ref, state),
+          relativizeLibs(ref, state),
+          state
         )
       )
     }
     effects.sequence[ValidationNELS, IO[String]] map (_.sequence)
   }
 
-  def onFailure(errors: NELS)(implicit state: State) = {
+  def onFailure(state: State)(errors: NELS) = {
     state.log.error("Could not create Eclipse project files: %s" format (errors.list mkString ", "))
     state.fail
   }
 
-  def onSuccess(effects: IO[Seq[String]])(implicit state: State) = {
+  def onSuccess(state: State)(effects: IO[Seq[String]]) = {
     val names = effects.unsafePerformIO
     if (names.isEmpty)
       state.log.warn("There was no project to create Eclipse project files for!")
@@ -145,7 +147,8 @@ private object Eclipse {
   def effect(
     jreContainer: String,
     preTasks: Seq[(TaskKey[_], ProjectRef)],
-    relativizeLibs: Boolean)(
+    relativizeLibs: Boolean,
+    state: State)(
       classpathEntryTransformer: Seq[EclipseClasspathEntry] => Seq[EclipseClasspathEntry],
       name: String,
       buildDirectory: File,
@@ -153,10 +156,9 @@ private object Eclipse {
       srcDirectories: Seq[(File, File)],
       scalacOptions: Seq[(String, String)],
       externalDependencies: Seq[Lib],
-      projectDependencies: Seq[String])(
-        implicit state: State) = {
+      projectDependencies: Seq[String]) = {
     for {
-      _ <- executePreTasks(preTasks)
+      _ <- executePreTasks(preTasks, state)
       n <- io(name)
       _ <- saveXml(baseDirectory / ".project", projectXml(name))
       cp <- classpath(
@@ -167,15 +169,16 @@ private object Eclipse {
         srcDirectories,
         externalDependencies,
         projectDependencies,
-        jreContainer
+        jreContainer,
+        state
       )
       _ <- saveXml(baseDirectory / ".classpath", cp)
       _ <- saveProperties(baseDirectory / ".settings" / "org.scala-ide.sdt.core.prefs", scalacOptions)
     } yield n
   }
 
-  def executePreTasks(preTasks: Seq[(TaskKey[_], ProjectRef)])(implicit state: State) =
-    io(for ((preTask, ref) <- preTasks) evaluateTask(preTask, ref)(state))
+  def executePreTasks(preTasks: Seq[(TaskKey[_], ProjectRef)], state: State) =
+    io(for ((preTask, ref) <- preTasks) evaluateTask(preTask, ref, state))
 
   def projectXml(name: String) =
     <projectDescription>
@@ -199,12 +202,13 @@ private object Eclipse {
     srcDirectories: Seq[(File, File)],
     externalDependencies: Seq[Lib],
     projectDependencies: Seq[String],
-    jreContainer: String)(
-      implicit state: State) = {
-    val srcEntriesIoSeq = for ((dir, output) <- srcDirectories) yield srcEntry(baseDirectory, dir, output)
+    jreContainer: String,
+    state: State) = {
+    val srcEntriesIoSeq =
+      for ((dir, output) <- srcDirectories) yield srcEntry(baseDirectory, dir, output, state)
     for (srcEntries <- srcEntriesIoSeq.sequence) yield {
       val entries = srcEntries ++
-        (externalDependencies map libEntry(buildDirectory, baseDirectory, relativizeLibs)) ++
+        (externalDependencies map libEntry(buildDirectory, baseDirectory, relativizeLibs, state)) ++
         (projectDependencies map EclipseClasspathEntry.Project) ++
         (Seq(jreContainer) map EclipseClasspathEntry.Con) ++
         (Seq("bin") map EclipseClasspathEntry.Output)
@@ -212,7 +216,7 @@ private object Eclipse {
     }
   }
 
-  def srcEntry(baseDirectory: File, srcDirectory: File, classDirectory: File)(implicit state: State) =
+  def srcEntry(baseDirectory: File, srcDirectory: File, classDirectory: File, state: State) =
     io {
       if (!srcDirectory.exists()) srcDirectory.mkdirs()
       EclipseClasspathEntry.Src(
@@ -224,9 +228,9 @@ private object Eclipse {
   def libEntry(
     buildDirectory: File,
     baseDirectory: File,
-    relativizeLibs: Boolean)(
-      lib: Lib)(
-        implicit state: State) = {
+    relativizeLibs: Boolean,
+    state: State)(
+      lib: Lib) = {
     def path(file: File) = {
       val relativizedBase =
         if (buildDirectory === baseDirectory) Some(".") else IO.relativize(buildDirectory, baseDirectory)
@@ -251,32 +255,32 @@ private object Eclipse {
 
   // Getting and transforming mandatory settings and task results
 
-  def name(ref: Reference)(implicit state: State) =
-    setting(Keys.name in ref)
+  def name(ref: Reference, state: State) =
+    setting(Keys.name in ref, state)
 
-  def buildDirectory(implicit state: State) =
-    setting(Keys.baseDirectory in ThisBuild)
+  def buildDirectory(state: State) =
+    setting(Keys.baseDirectory in ThisBuild, state)
 
-  def baseDirectory(ref: Reference)(implicit state: State) =
-    setting(Keys.baseDirectory in ref)
+  def baseDirectory(ref: Reference, state: State) =
+    setting(Keys.baseDirectory in ref, state)
 
-  def target(ref: Reference)(implicit state: State) =
-    setting(Keys.target in ref)
+  def target(ref: Reference, state: State) =
+    setting(Keys.target in ref, state)
 
   def srcDirectories(
     ref: Reference,
     createSrc: EclipseCreateSrc.ValueSet,
-    eclipseOutput: Option[String])(
-      configuration: Configuration)(
-        implicit state: State) = {
+    eclipseOutput: Option[String],
+    state: State)(
+      configuration: Configuration) = {
     import EclipseCreateSrc._
     val classDirectory = eclipseOutput match {
-      case Some(name) => baseDirectory(ref) map (new File(_, name))
-      case None => setting(Keys.classDirectory in (ref, configuration))
+      case Some(name) => baseDirectory(ref, state) map (new File(_, name))
+      case None => setting(Keys.classDirectory in (ref, configuration), state)
     }
     def dirs(values: ValueSet, key: SettingKey[Seq[File]]) =
       if (values subsetOf createSrc)
-        (setting(key in (ref, configuration)) <**> classDirectory)((sds, cd) => sds map (_ -> cd))
+        (setting(key in (ref, configuration), state) <**> classDirectory)((sds, cd) => sds map (_ -> cd))
       else
         "".failNel
     Seq(
@@ -284,11 +288,11 @@ private object Eclipse {
       dirs(ValueSet(Managed, Source), Keys.managedSourceDirectories),
       dirs(ValueSet(Unmanaged, Resource), Keys.unmanagedResourceDirectories),
       dirs(ValueSet(Managed, Resource), Keys.managedResourceDirectories)
-    ).reduceLeft(_ >>*<< _)
+    ) reduceLeft (_ >>*<< _)
   }
 
-  def scalacOptions(ref: ProjectRef)(implicit state: State) =
-    evaluateTask(Keys.scalacOptions, ref) map (options =>
+  def scalacOptions(ref: ProjectRef, state: State) =
+    evaluateTask(Keys.scalacOptions, ref, state) map (options =>
       if (options.isEmpty) Nil
       else {
         def pluginValues(value: String) =
@@ -309,11 +313,11 @@ private object Eclipse {
 
   def externalDependencies(
     ref: ProjectRef,
-    withSource: Boolean)(
-      configuration: Configuration)(
-        implicit state: State) = {
+    withSource: Boolean,
+    state: State)(
+      configuration: Configuration) = {
     def moduleToFile(key: TaskKey[UpdateReport], p: (Artifact, File) => Boolean = (_, _) => true) =
-      evaluateTask(key in configuration, ref) map { updateReport =>
+      evaluateTask(key in configuration, ref, state) map { updateReport =>
         val moduleToFile =
           for {
             configurationReport <- (updateReport configuration configuration.name).toSeq
@@ -328,78 +332,87 @@ private object Eclipse {
           (moduleId, binaryFile) <- binaries
           sourceFile <- sources get moduleId
         } yield binaryFile -> sourceFile
-      val libs = files.files map { file => Lib(file)(binaryFilesToSourceFiles get file) }
-      libs
+      files.files map (file => Lib(file)(binaryFilesToSourceFiles get file))
     }
-    val externalDependencyClasspath = evaluateTask(Keys.externalDependencyClasspath in configuration, ref)
+    val externalDependencyClasspath =
+      evaluateTask(Keys.externalDependencyClasspath in configuration, ref, state)
     val binaryModuleToFile = moduleToFile(Keys.update)
     val sourceModuleToFile =
       if (withSource)
         moduleToFile(Keys.updateClassifiers, (artifact, _) => artifact.classifier === Some("sources"))
       else
         Map[ModuleID, File]().success
-    val externalDependencies = (externalDependencyClasspath |@| binaryModuleToFile |@| sourceModuleToFile)(libs)
-    state.log.debug("External dependencies for configuration '%s' and withSource '%s': %s".format(configuration, withSource, externalDependencies))
+    val externalDependencies =
+      (externalDependencyClasspath |@| binaryModuleToFile |@| sourceModuleToFile)(libs)
+    state.log.debug(
+      "External dependencies for configuration '%s' and withSource '%s': %s".format(
+        configuration,
+        withSource,
+        externalDependencies
+      )
+    )
     externalDependencies
   }
 
   def projectDependencies(
     ref: ProjectRef,
-    project: ResolvedProject)(
-      configuration: Configuration)(
-        implicit state: State) = {
+    project: ResolvedProject,
+    state: State)(
+      configuration: Configuration) = {
     val projectDependencies = project.dependencies collect {
-      case dependency if isInConfiguration(configuration, ref, dependency) =>
-        setting(Keys.name in dependency.project)
+      case dependency if isInConfiguration(configuration, ref, dependency, state) =>
+        setting(Keys.name in dependency.project, state)
     }
     val projectDependenciesSeq = projectDependencies.sequence
     state.log.debug("Project dependencies for configuration '%s': %s".format(configuration, projectDependenciesSeq))
     projectDependenciesSeq
   }
 
-  def isInConfiguration(configuration: Configuration, ref: ProjectRef, dependency: ClasspathDep[ProjectRef])(
-    implicit state: State) = {
-    val map =
-      Classpaths.mapped(
-        dependency.configuration,
-        Configurations.names(Classpaths.getConfigurations(ref, structure.data)),
-        Configurations.names(Classpaths.getConfigurations(dependency.project, structure.data)),
-        "compile", "*->compile"
-      )
+  def isInConfiguration(
+    configuration: Configuration,
+    ref: ProjectRef,
+    dependency: ClasspathDep[ProjectRef],
+    state: State) = {
+    val map = Classpaths.mapped(
+      dependency.configuration,
+      Configurations.names(Classpaths.getConfigurations(ref, structure(state).data)),
+      Configurations.names(Classpaths.getConfigurations(dependency.project, structure(state).data)),
+      "compile", "*->compile"
+    )
     !map(configuration.name).isEmpty
   }
 
   // Getting and transforming optional settings and task results
 
-  def executionEnvironment(ref: Reference)(implicit state: State) =
-    setting(EclipseKeys.executionEnvironment in ref).fold(_ => None, id)
+  def executionEnvironment(ref: Reference, state: State) =
+    setting(EclipseKeys.executionEnvironment in ref, state).fold(_ => None, id)
 
-  def skipParents(ref: Reference)(implicit state: State) =
-    setting(EclipseKeys.skipParents in ref).fold(_ => true, id)
+  def skipParents(ref: Reference, state: State) =
+    setting(EclipseKeys.skipParents in ref, state).fold(_ => true, id)
 
-  def withSource(ref: Reference)(implicit state: State) =
-    setting(EclipseKeys.withSource in ref).fold(_ => false, id)
+  def withSource(ref: Reference, state: State) =
+    setting(EclipseKeys.withSource in ref, state).fold(_ => false, id)
 
-  def classpathEntryTransformerFactory(ref: Reference)(implicit state: State) =
-    setting(EclipseKeys.classpathEntryTransformerFactory in ref).fold(_ => EclipseClasspathEntryTransformerFactory.Default, id)
+  def classpathEntryTransformerFactory(ref: Reference, state: State) =
+    setting(EclipseKeys.classpathEntryTransformerFactory in ref, state).fold(_ => EclipseClasspathEntryTransformerFactory.Default, id)
 
-  def configurations(ref: Reference)(implicit state: State) =
-    setting(EclipseKeys.configurations in ref).fold(
+  def configurations(ref: Reference, state: State) =
+    setting(EclipseKeys.configurations in ref, state).fold(
       _ => Seq(Configurations.Compile, Configurations.Test),
       _.toSeq
     )
 
-  def createSrc(ref: Reference)(implicit state: State) =
-    setting(EclipseKeys.createSrc in ref).fold(_ => EclipseCreateSrc.Default, id)
+  def createSrc(ref: Reference, state: State) =
+    setting(EclipseKeys.createSrc in ref, state).fold(_ => EclipseCreateSrc.Default, id)
 
-  def eclipseOutput(ref: ProjectRef)(implicit state: State) =
-    setting(EclipseKeys.eclipseOutput in ref).fold(_ => None, id)
+  def eclipseOutput(ref: ProjectRef, state: State) =
+    setting(EclipseKeys.eclipseOutput in ref, state).fold(_ => None, id)
 
-  def preTasks(ref: ProjectRef)(implicit state: State) =
-    setting(EclipseKeys.preTasks in ref).fold(_ => Seq.empty, _.zipAll(Seq.empty, null, ref))
+  def preTasks(ref: ProjectRef, state: State) =
+    setting(EclipseKeys.preTasks in ref, state).fold(_ => Seq.empty, _.zipAll(Seq.empty, null, ref))
 
-  def relativizeLibs(ref: ProjectRef)(implicit state: State) =
-    setting(EclipseKeys.relativizeLibs in ref).fold(_ => true, id)
+  def relativizeLibs(ref: ProjectRef, state: State) =
+    setting(EclipseKeys.relativizeLibs in ref, state).fold(_ => true, id)
 
   // IO
 
