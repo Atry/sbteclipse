@@ -53,7 +53,7 @@ import sbt.{
 import sbt.complete.Parser
 import scala.xml.{ Elem, PrettyPrinter }
 import scalaz.{ Failure, NonEmptyList, Success }
-import scalaz.Scalaz._
+import scalaz.Scalaz.{ state => st, _ }
 import scalaz.effects._
 
 private object Eclipse {
@@ -106,22 +106,37 @@ private object Eclipse {
       project <- Project.getProject(ref, structure(state)) if project.aggregate.isEmpty || !skipParents
     } yield {
       val configs = configurations(ref, state)
-      val applic = classpathEntryTransformerFactory(ref, state).createTransformer(ref, state) |@|
-        name(ref, state) |@|
-        buildDirectory(state) |@|
-        baseDirectory(ref, state) |@|
-        mapConfigurations(configs, srcDirectories(ref, createSrc(ref, state), eclipseOutput(ref, state), state)) |@|
-        scalacOptions(ref, state) |@|
-        mapConfigurations(configs, externalDependencies(ref, withSourceArg getOrElse withSource(ref, state), state)) |@|
-        mapConfigurations(configs, projectDependencies(ref, project, state))
-      applic(
-        handleProject(
-          jreContainer(executionEnvironmentArg orElse executionEnvironment(ref, state)),
-          preTasks(ref, state),
-          relativizeLibs(ref, state),
-          state
+      val wsource = withSource(ref, state)
+
+      val cetf = classpathEntryTransformerFactory(ref, state).createTransformer(ref, state)
+      val n = name(ref, state)
+      val buildd = buildDirectory(state)
+      val based = baseDirectory(ref, state)
+      val srcd = mapConfigurations(configs, srcDirectories(ref, createSrc(ref, state), eclipseOutput(ref, state), state))
+      val pd = mapConfigurations(configs, projectDependencies(ref, project, state))
+
+      val foo = for {
+        scalacOptions <- st(scalacOptions(ref))
+        mc <- mapConfigurations2(configs, externalDependencies(ref, withSourceArg getOrElse wsource))
+      } yield {
+        val applic = cetf |@|
+          n |@|
+          buildd |@|
+          based |@|
+          srcd |@|
+          scalacOptions |@|
+          mc |@|
+          pd
+        applic(
+          handleProject(
+            jreContainer(executionEnvironmentArg orElse executionEnvironment(ref, state)),
+            preTasks(ref, state),
+            relativizeLibs(ref, state),
+            state
+          )
         )
-      )
+      }
+      foo ! state
     }
     effects.sequence[Validation, IO[String]] map (_.sequence)
   }
@@ -144,6 +159,15 @@ private object Eclipse {
     configurations: Seq[Configuration],
     f: Configuration => Validation[Seq[A]]): Validation[Seq[A]] =
     (configurations map f).sequence map (_.flatten.distinct)
+
+  def mapConfigurations2[A](
+    configurations: Seq[Configuration],
+    f: Configuration => scalaz.State[State, Validation[Seq[A]]]) = {
+    val foo = configurations map f
+    val foox = foo.sequence[StateState, Validation[Seq[A]]]
+    val fooy = foox map (x => x.sequence map (_.flatten.distinct))
+    fooy
+  }
 
   def handleProject(
     jreContainer: String,
@@ -179,7 +203,8 @@ private object Eclipse {
   }
 
   def executePreTasks(preTasks: Seq[(TaskKey[_], ProjectRef)], state: State): IO[Unit] =
-    io(for ((preTask, ref) <- preTasks) evaluateTask(preTask, ref, state))
+    //io(for ((preTask, ref) <- preTasks) evaluateTask(preTask, ref, state))
+    null
 
   def projectXml(name: String): Elem =
     <projectDescription>
@@ -296,8 +321,9 @@ private object Eclipse {
     ) reduceLeft (_ >>*<< _)
   }
 
-  def scalacOptions(ref: ProjectRef, state: State): Validation[Seq[(String, String)]] =
-    evaluateTask(Keys.scalacOptions, ref, state) map (options =>
+  def scalacOptions(ref: ProjectRef)(state: State): (State, Validation[Seq[(String, String)]]) = {
+    val (newState, sbtOptions) = evaluateTask(Keys.scalacOptions, ref)(state)
+    val options = sbtOptions map (options =>
       if (options.isEmpty) Nil
       else {
         def pluginValues(value: String) =
@@ -315,14 +341,16 @@ private object Eclipse {
         }
       }
     )
+    newState -> options
+  }
 
   def externalDependencies(
     ref: ProjectRef,
-    withSource: Boolean,
-    state: State)(
-      configuration: Configuration): Validation[Seq[Lib]] = {
-    def moduleToFile(key: TaskKey[UpdateReport], p: (Artifact, File) => Boolean = (_, _) => true) =
-      evaluateTask(key in configuration, ref, state) map { updateReport =>
+    withSource: Boolean)(
+      configuration: Configuration) = {
+    def moduleToFile(key: TaskKey[UpdateReport], p: (Artifact, File) => Boolean = (_, _) => true)(state: State) = {
+      val (newState, updateReport) = evaluateTask(key in configuration, ref)(state)
+      val files = updateReport map { updateReport =>
         val moduleToFile =
           for {
             configurationReport <- (updateReport configuration configuration.name).toSeq
@@ -331,6 +359,8 @@ private object Eclipse {
           } yield moduleReport.module -> file
         moduleToFile.toMap
       }
+      newState -> files
+    }
     def libs(files: Seq[Attributed[File]], binaries: Map[ModuleID, File], sources: Map[ModuleID, File]) = {
       val binaryFilesToSourceFiles =
         for {
@@ -339,24 +369,28 @@ private object Eclipse {
         } yield binaryFile -> sourceFile
       files.files map (file => Lib(file)(binaryFilesToSourceFiles get file))
     }
-    val externalDependencyClasspath =
-      evaluateTask(Keys.externalDependencyClasspath in configuration, ref, state)
-    val binaryModuleToFile = moduleToFile(Keys.update)
-    val sourceModuleToFile =
+    def foo(state: State) =
       if (withSource)
-        moduleToFile(Keys.updateClassifiers, (artifact, _) => artifact.classifier === Some("sources"))
+        moduleToFile(Keys.updateClassifiers, (artifact, _) => artifact.classifier === Some("sources"))(state)
       else
-        Map[ModuleID, File]().success
-    val externalDependencies =
-      (externalDependencyClasspath |@| binaryModuleToFile |@| sourceModuleToFile)(libs)
-    state.log.debug(
-      "External dependencies for configuration '%s' and withSource '%s': %s".format(
-        configuration,
-        withSource,
-        externalDependencies
-      )
-    )
-    externalDependencies
+        state -> Map[ModuleID, File]().success
+
+    for {
+      externalDependencyClasspath <- st(evaluateTask(Keys.externalDependencyClasspath in configuration, ref))
+      binaryModuleToFile <- st(moduleToFile(Keys.update))
+      sourceModuleToFile <- st(foo)
+    } yield {
+      val externalDependencies =
+        (externalDependencyClasspath |@| binaryModuleToFile |@| sourceModuleToFile)(libs)
+      //      state.log.debug(
+      //        "External dependencies for configuration '%s' and withSource '%s': %s".format(
+      //          configuration,
+      //          withSource,
+      //          externalDependencies
+      //        )
+      //      )
+      externalDependencies
+    }
   }
 
   def projectDependencies(
